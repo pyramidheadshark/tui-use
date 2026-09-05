@@ -9,6 +9,7 @@
 import * as pty from "node-pty";
 import { Terminal } from "@xterm/headless";
 import { SessionInfo } from "./protocol";
+import { adjustCursor } from "./cursor";
 import { extractHighlights, Highlight } from "./highlights";
 
 // ---- ANSI re-encoding helpers ----
@@ -294,7 +295,7 @@ export class Session {
    * Trailing empty lines and per-line trailing spaces are removed.
    * Updates lastSnapshot for change detection.
    */
-  snapshot(options?: { color?: boolean }): { lines: string[]; cursor: { x: number; y: number }; changed: boolean; highlights: Highlight[]; title: string; is_fullscreen: boolean } {
+  snapshot(options?: { color?: boolean }): { lines: string[]; cursor: { x: number; y: number }; changed: boolean; highlights: Highlight[]; title: string; is_fullscreen: boolean; leading_trimmed: number; trailing_trimmed: number } {
     const buf = this.terminal.buffer.active;
     const useColor = options?.color ?? false;
     const plainLines: string[] = [];
@@ -303,12 +304,16 @@ export class Session {
       plainLines.push((buf.getLine(startY + i)?.translateToString(true) ?? "").trimEnd());
     }
     // Remove trailing empty lines
+    let plainTrailingTrimmed = 0;
     while (plainLines.length > 0 && plainLines[plainLines.length - 1] === "") {
       plainLines.pop();
+      plainTrailingTrimmed++;
     }
     // Remove leading empty lines (TUI apps like fzf render from bottom)
+    let plainLeadingTrimmed = 0;
     while (plainLines.length > 0 && plainLines[0] === "") {
       plainLines.shift();
+      plainLeadingTrimmed++;
     }
     // Change detection always uses plain text
     const plainScreen = plainLines.join("\n");
@@ -317,6 +322,8 @@ export class Session {
 
     // Build color lines if requested
     let lines: string[];
+    let colorLeadingTrimmed = 0;
+    let colorTrailingTrimmed = 0;
     if (useColor) {
       lines = [];
       for (let i = 0; i < this.terminal.rows; i++) {
@@ -326,21 +333,43 @@ export class Session {
       // Trim trailing empty lines (match plain text trimming)
       while (lines.length > 0 && lines[lines.length - 1] === "") {
         lines.pop();
+        colorTrailingTrimmed++;
       }
       while (lines.length > 0 && lines[0] === "") {
         lines.shift();
+        colorLeadingTrimmed++;
       }
     } else {
       lines = plainLines;
     }
-    const highlights = extractHighlights(buf, this.terminal.rows, startY);
+
+    // Coordinates are reported in the SAME frame as `lines`.
+    //
+    // Before this, three frames coexisted: `lines` was trimmed, while `cursor` and
+    // `highlights` kept raw viewport rows, so any caller indexing `lines[cursor.y]`
+    // was off by exactly the number of trimmed leading rows. Worse, the colour branch
+    // trims independently — `renderLineWithColor` returns a non-empty string for a
+    // visually blank line that carries a background colour (panels, status bars,
+    // selected rows), so plain and colour modes could trim different amounts.
+    //
+    // `leading_trimmed`/`trailing_trimmed` are reported for the mode actually
+    // returned, so a caller can always map back to raw buffer rows if it needs to.
+    const leadingTrimmed = useColor ? colorLeadingTrimmed : plainLeadingTrimmed;
+    const trailingTrimmed = useColor ? colorTrailingTrimmed : plainTrailingTrimmed;
+
+    const highlights = extractHighlights(buf, this.terminal.rows, startY)
+      .map((h) => ({ ...h, line: h.line - leadingTrimmed }))
+      .filter((h) => h.line >= 0 && h.line < lines.length);
+
     return {
       lines,
-      cursor: { x: buf.cursorX, y: buf.cursorY },
+      cursor: adjustCursor({ x: buf.cursorX, y: buf.cursorY }, leadingTrimmed, trailingTrimmed, this.terminal.rows),
       changed,
       highlights,
       title: this._title,
       is_fullscreen: this._isFullscreen,
+      leading_trimmed: leadingTrimmed,
+      trailing_trimmed: trailingTrimmed,
     };
   }
 
@@ -437,25 +466,40 @@ export class Session {
     const buf = this.terminal.buffer.active;
     let regex: RegExp;
     try {
-      regex = new RegExp(pattern);
+      // The `g` flag is what makes the loop below find EVERY occurrence. Without it
+      // a single exec() returned at most one match per line, silently hiding the rest.
+      regex = new RegExp(pattern, "g");
     } catch {
       return matches;
     }
 
     const startY = buf.viewportY;
+    // Report rows in the same frame as snapshot().lines — see the note in snapshot().
+    const { leading_trimmed: leadingTrimmed, lines } = this.snapshot();
+
     for (let i = 0; i < this.terminal.rows; i++) {
       const line = buf.getLine(startY + i);
-      if (line) {
-        const lineText = line.translateToString(true);
-        const match = regex.exec(lineText);
-        if (match) {
+      if (!line) continue;
+      const lineText = line.translateToString(true);
+      regex.lastIndex = 0;
+
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(lineText)) !== null) {
+        const row = i - leadingTrimmed;
+        if (row >= 0 && row < lines.length) {
           matches.push({
-            line: i,
+            line: row,
             col_start: match.index,
-            col_end: match.index + match[0].length,
+            // INCLUSIVE, matching Highlight.col_end ("index of the last character").
+            // It used to be exclusive here while inclusive there — the same number
+            // meant two different columns depending on which call produced it.
+            col_end: match.index + match[0].length - 1,
             text: match[0],
           });
         }
+        // A zero-length match would never advance lastIndex — step over it manually,
+        // otherwise the loop spins forever on patterns like `a*` or `^`.
+        if (match[0].length === 0) regex.lastIndex++;
       }
     }
     return matches;
