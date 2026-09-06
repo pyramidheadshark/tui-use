@@ -11,6 +11,16 @@ import { Terminal } from "@xterm/headless";
 import { SessionInfo } from "./protocol";
 import { adjustCursor } from "./cursor";
 import { extractHighlights, Highlight } from "./highlights";
+import {
+  acceptsMouse,
+  encodeClick,
+  encodeMouseEvent,
+  MouseButton,
+  MouseModifiers,
+  MouseTrackingMode,
+  toViewportRow,
+  trackSgrMode,
+} from "./mouse";
 
 // ---- ANSI re-encoding helpers ----
 
@@ -189,6 +199,7 @@ export class Session {
 
   private ptyProcess: pty.IPty;
   private terminal: Terminal;
+  private _sgrMouse = false;
   private _status: "running" | "exited" = "running";
   private _exitCode: number | null = null;
   private lastSnapshot: string = "";
@@ -236,6 +247,10 @@ export class Session {
     });
 
     this.ptyProcess.onData((data: string) => {
+      // Кодировку мыши отслеживаем САМИ: `@xterm/headless` отдаёт `modes.mouseTrackingMode`,
+      // но не отдаёт выбор между SGR (`CSI ? 1006 h`) и устаревшей X10. Разница не
+      // косметическая — X10 не выражает колонку больше 223 и молча промахивается.
+      this._sgrMouse = trackSgrMode(data, this._sgrMouse);
       this.terminal.write(data);
       this.notifyListeners();
     });
@@ -288,6 +303,95 @@ export class Session {
       );
     }
     this.ptyProcess.write(mapped);
+  }
+
+  /** Режим отслеживания мыши, объявленный приложением (DECSET 9/1000/1002/1003). */
+  get mouseTrackingMode(): MouseTrackingMode {
+    return this.terminal.modes.mouseTrackingMode;
+  }
+
+  /** Включил ли приложение SGR-кодировку (`CSI ? 1006 h`). */
+  get sgrMouse(): boolean {
+    return this._sgrMouse;
+  }
+
+  private assertMouseAccepted(action: "press" | "release" | "move"): void {
+    if (this._status === "exited") {
+      throw new Error(`Session ${this.id} has already exited`);
+    }
+    const mode = this.mouseTrackingMode;
+    if (acceptsMouse(mode, action)) return;
+    // Отказ, а не молчание: приложение, не включавшее мышь, получит эти байты как обычный
+    // ввод — в оболочке они окажутся текстом в командной строке. Молчаливая отправка
+    // выглядела бы как «клик не сработал», а на деле портила бы состояние.
+    throw new Error(
+      mode === "none"
+        ? `Приложение не включало отслеживание мыши (mouseTrackingMode=none). ` +
+          `Отправка события мыши ушла бы в stdin как мусорный ввод. ` +
+          `Если интерфейс кликабельный, дай ему дорисоваться и повтори: режим объявляется при старте.`
+        : `Режим мыши "${mode}" не принимает событие "${action}" (x10 подписан только на нажатие).`
+    );
+  }
+
+  /**
+   * Клик по координатам СНАПШОТА (той же системе, что `lines[]`, `cursor` и `find`).
+   *
+   * Перевод в сырую систему вьюпорта делает `toViewportRow`, а не вызывающий: обрезанных
+   * сверху строк он не видит, и держать поправку в голове — источник промаха ровно на
+   * `leading_trimmed`. `raw: true` отключает поправку для тех, кто уже считает в сырой.
+   */
+  click(
+    col: number,
+    row: number,
+    options?: { button?: MouseButton; raw?: boolean; modifiers?: MouseModifiers }
+  ): { col: number; row: number; encoding: "sgr" | "x10" } {
+    this.assertMouseAccepted("press");
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.snapshot().leading_trimmed);
+    this.ptyProcess.write(
+      encodeClick({
+        button: options?.button ?? "left",
+        col,
+        row: viewportRow,
+        sgr: this._sgrMouse,
+        mode: this.mouseTrackingMode,
+        modifiers: options?.modifiers,
+      })
+    );
+    return { col, row: viewportRow, encoding: this._sgrMouse ? "sgr" : "x10" };
+  }
+
+  /** Перемещение курсора мыши без нажатия — принимается только в режимах drag/any. */
+  mouseMove(col: number, row: number, options?: { raw?: boolean }): { col: number; row: number } {
+    this.assertMouseAccepted("move");
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.snapshot().leading_trimmed);
+    this.ptyProcess.write(
+      encodeMouseEvent({ action: "move", button: "left", col, row: viewportRow, sgr: this._sgrMouse })
+    );
+    return { col, row: viewportRow };
+  }
+
+  /** Прокрутка колесом. Кодируется как нажатие кнопки 64/65 — так его ждёт приложение. */
+  wheel(
+    direction: "up" | "down",
+    col: number,
+    row: number,
+    options?: { raw?: boolean; count?: number }
+  ): { col: number; row: number; count: number } {
+    this.assertMouseAccepted("press");
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.snapshot().leading_trimmed);
+    const count = Math.max(1, options?.count ?? 1);
+    for (let i = 0; i < count; i += 1) {
+      this.ptyProcess.write(
+        encodeMouseEvent({
+          action: "press",
+          button: direction === "up" ? "wheel-up" : "wheel-down",
+          col,
+          row: viewportRow,
+          sgr: this._sgrMouse,
+        })
+      );
+    }
+    return { col, row: viewportRow, count };
   }
 
   /**

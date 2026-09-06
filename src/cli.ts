@@ -210,6 +210,81 @@ program
     });
   });
 
+// ---- click / mousemove / wheel ----
+//
+// Координаты берутся в системе СНАПШОТА: `tui-use find "Кнопка"` печатает `L3,C10-16`,
+// и `tui-use click 10 3` попадает именно туда. Поправку на срезанные сверху строки делает
+// сессия — держать её в голове было бы источником промаха ровно на `leading_trimmed`.
+program
+  .command("click <col> <row>")
+  .description("Click at snapshot coordinates (same frame as `find` and `snapshot`)")
+  .option("-b, --button <button>", "left | middle | right", "left")
+  .option("--raw", "coordinates are raw viewport rows, not snapshot rows")
+  .option("--ctrl", "hold Ctrl")
+  .option("--alt", "hold Alt")
+  .option("--shift", "hold Shift")
+  .action(async (col: string, row: string, opts: Record<string, unknown>) => {
+    const c = parseInt(col, 10);
+    const r = parseInt(row, 10);
+    if (isNaN(c) || isNaN(r)) {
+      process.stderr.write("Error: col and row must be numbers\n");
+      process.exit(1);
+    }
+    const res = await sendRequest({
+      type: "mouse",
+      action: "click",
+      col: c,
+      row: r,
+      button: (opts.button as "left" | "middle" | "right") ?? "left",
+      raw: Boolean(opts.raw),
+      modifiers: { ctrl: Boolean(opts.ctrl), alt: Boolean(opts.alt), shift: Boolean(opts.shift) },
+    });
+    handleResponse(res, (x) => {
+      if (x.type === "mouse") console.log(JSON.stringify(x));
+    });
+  });
+
+program
+  .command("mousemove <col> <row>")
+  .description("Move the mouse pointer without pressing (requires drag/any tracking)")
+  .option("--raw", "coordinates are raw viewport rows, not snapshot rows")
+  .action(async (col: string, row: string, opts: Record<string, unknown>) => {
+    const res = await sendRequest({
+      type: "mouse",
+      action: "move",
+      col: parseInt(col, 10),
+      row: parseInt(row, 10),
+      raw: Boolean(opts.raw),
+    });
+    handleResponse(res, (x) => {
+      if (x.type === "mouse") console.log(JSON.stringify(x));
+    });
+  });
+
+program
+  .command("wheel <direction> [col] [row]")
+  .description("Scroll the mouse wheel at a point: up | down")
+  .option("-n, --count <n>", "number of wheel steps", "1")
+  .option("--raw", "coordinates are raw viewport rows, not snapshot rows")
+  .action(async (direction: string, col = "0", row = "0", opts: Record<string, unknown>) => {
+    if (direction !== "up" && direction !== "down") {
+      process.stderr.write('Error: direction must be "up" or "down"\n');
+      process.exit(1);
+    }
+    const res = await sendRequest({
+      type: "mouse",
+      action: "wheel",
+      direction,
+      col: parseInt(col, 10),
+      row: parseInt(row, 10),
+      count: parseInt(String(opts.count ?? "1"), 10),
+      raw: Boolean(opts.raw),
+    });
+    handleResponse(res, (x) => {
+      if (x.type === "mouse") console.log(JSON.stringify(x));
+    });
+  });
+
 // ---- scrollup ----
 program
   .command("scrollup <lines>")
@@ -264,6 +339,8 @@ program
         }
         console.log(`Size: ${r.cols}x${r.rows}`);
         console.log(`Started: ${new Date(r.start_time).toISOString()}`);
+        // Без этих двух строк «клик не сработал» неотличимо от «приложение мышь не включало».
+        console.log(`Mouse: tracking=${r.mouse_tracking} encoding=${r.mouse_encoding}`);
       }
     });
   });

@@ -20,7 +20,8 @@ export type Request =
   | FindRequest
   | ScrollRequest
   | InfoRequest
-  | RenameRequest;
+  | RenameRequest
+  | MouseRequest;
 
 export interface StartRequest {
   type: "start";
@@ -90,6 +91,23 @@ export interface InfoRequest {
   type: "info";
 }
 
+/**
+ * События мыши. Координаты — в системе СНАПШОТА (той же, что `lines[]`, `cursor`, `find`);
+ * поправку на срезанные сверху строки делает сессия, а не вызывающий. `raw: true` —
+ * для тех, кто уже считает в сырой системе вьюпорта.
+ */
+export interface MouseRequest {
+  type: "mouse";
+  action: "click" | "move" | "wheel";
+  col: number;
+  row: number;
+  button?: "left" | "middle" | "right";
+  direction?: "up" | "down";
+  count?: number;
+  raw?: boolean;
+  modifiers?: { shift?: boolean; alt?: boolean; ctrl?: boolean };
+}
+
 export interface RenameRequest {
   type: "rename";
   label: string;
@@ -110,6 +128,7 @@ export type Response =
   | ScrollResponse
   | InfoResponse
   | RenameResponse
+  | MouseResponse
   | ErrorResponse;
 
 export interface StartResponse {
@@ -189,6 +208,17 @@ export interface FindResponse {
   }>;
 }
 
+export interface MouseResponse {
+  type: "mouse";
+  ok: boolean;
+  /** Куда событие ушло на самом деле — в СЫРОЙ системе вьюпорта. */
+  col: number;
+  row: number;
+  /** Что объявило приложение: без этого «клик не сработал» неотличим от «мышь выключена». */
+  tracking: "none" | "x10" | "vt200" | "drag" | "any";
+  encoding: "sgr" | "x10";
+}
+
 export interface ScrollResponse {
   type: "scroll";
   lines: number;
@@ -204,7 +234,8 @@ export interface InfoResponse {
   exit_code: number | null;
   start_time: number;
   cols: number;
-  rows: number;
+  rows: number;  mouse_tracking: "none" | "x10" | "vt200" | "drag" | "any";
+  mouse_encoding: "sgr" | "x10";
 }
 
 export interface RenameResponse {
