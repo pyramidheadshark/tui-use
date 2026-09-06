@@ -37,6 +37,26 @@ finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
 `;
 
+
+/** Включает мышь, печатает метку и МОЛЧА глотает события: нужен, чтобы «изменение
+ *  экрана» в тесте создавалось только тем, чем мы хотим, а не ответом приложения. */
+const QUIET_APP = `import sys, tty, termios
+fd = sys.stdin.fileno(); old = termios.tcgetattr(fd); tty.setraw(fd)
+sys.stdout.write("\\x1b[?1000h\\x1b[?1006h")
+sys.stdout.write("\\x1b[2J\\x1b[H")
+sys.stdout.write("\\r\\n\\r\\n")
+sys.stdout.write("КНОПКА\\r\\n")
+sys.stdout.flush()
+try:
+    while True:
+        ch = sys.stdin.read(1)
+        if not ch or ch == "q": break
+        if ch == "z":
+            sys.stdout.write("МЕТКА\\r\\n"); sys.stdout.flush()
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+`;
+
 const settle = (ms = 900) => new Promise(r => setTimeout(r, ms));
 
 describe("мышь против живого приложения", () => {
@@ -99,5 +119,58 @@ describe("мышь против живого приложения", () => {
   it("НЕГАТИВНЫЙ: движение в режиме vt200 отвергается — приложение его не ждёт", async () => {
     session = await startApp();
     expect(() => session?.mouseMove(1, 1)).toThrow(/не принимает событие "move"/);
+  });
+});
+
+/**
+ * Побочный эффект `snapshot()` внутри клика съедал базовую линию детекции изменений и
+ * ослеплял `wait()` — ровно посреди канонической петли агента `type → click → wait`.
+ */
+describe("клик не съедает детекцию изменений", () => {
+  let session: Session | undefined;
+  let dir: string | undefined;
+
+  afterEach(() => {
+    try {
+      session?.kill();
+    } catch {
+      /* уже вышло */
+    }
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    session = undefined;
+    dir = undefined;
+  });
+
+  it("изменение экрана ДО клика не съедается кликом", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tui-use-changed-"));
+    const file = path.join(dir, "app.py");
+    fs.writeFileSync(file, QUIET_APP);
+    session = new Session("changed-e2e", `python3 -u ${file}`, { cols: 80, rows: 24 });
+    await settle();
+
+    const snap = session.snapshot(); // базовая линия
+    const row = snap.lines.findIndex(l => l.includes("КНОПКА"));
+    expect(row).toBeGreaterThanOrEqual(0);
+
+    session.send("z"); // приложение печатает МЕТКУ — экран изменился
+    await settle();
+
+    session.click(0, row); // приложение на клик молчит
+
+    // До починки внутренний `snapshot()` клика перезаписывал базовую линию, и изменение,
+    // случившееся ДО клика, терялось — `wait()` после этого досиживал до таймаута.
+    const after = session.snapshot();
+    expect(after.lines.some(l => l.includes("МЕТКА"))).toBe(true);
+    expect(after.changed).toBe(true);
+  });
+
+  it("НЕГАТИВНЫЙ: координата вне терминала — отказ, а не ok:true", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tui-use-bounds-"));
+    const file = path.join(dir, "app.py");
+    fs.writeFileSync(file, APP);
+    session = new Session("bounds-e2e", `python3 -u ${file}`, { cols: 80, rows: 24 });
+    await settle();
+    expect(() => session?.click(500, 0)).toThrow(/вне терминала 80x24/);
+    expect(() => session?.click(0, 999)).toThrow(/вне терминала/);
   });
 });

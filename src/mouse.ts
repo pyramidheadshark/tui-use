@@ -38,6 +38,15 @@ export interface MouseModifiers {
 }
 
 const BUTTON_CODE: Record<MouseButton, number> = { left: 0, middle: 1, right: 2 };
+/**
+ * «Кнопка не нажата» — младшие два бита `3`. Движение БЕЗ нажатия это `32 + 3 = 35`;
+ * `32 + 0 = 32` означает перетаскивание с зажатой левой.
+ *
+ * ⚠ Разница не формальная: hover-состояние `@opentui/core` (`ui/press.ts`) достигается
+ * только первым, а команда `mousemove` описана как «без нажатия». Первая версия слала 32,
+ * то есть ровно то состояние, ради которого мышь заводилась, оставалось недостижимым.
+ */
+const NO_BUTTON = 3;
 const WHEEL_UP = 64;
 const WHEEL_DOWN = 65;
 const MOTION_FLAG = 32;
@@ -45,8 +54,23 @@ const MOD_SHIFT = 4;
 const MOD_ALT = 8;
 const MOD_CTRL = 16;
 
-/** X10 кодирует координату как `32 + n` одним байтом: дальше 223 колонки её не выразить. */
-export const X10_MAX_COORD = 223;
+/**
+ * Предел координаты в устаревшей кодировке X10.
+ *
+ * X10 пишет координату ОДНИМ байтом `32 + n`. Формально это даёт 223 (255 − 32), и первая
+ * версия так и считала — но на проводе байт не один. `node-pty` по умолчанию кодирует
+ * запись в UTF-8 (`unixTerminal.js`: `encoding = opt.encoding === undefined ? "utf8"`),
+ * поэтому всё выше 127 уезжает ДВУМЯ байтами: колонка 222 даёт `0xC3 0xBE` вместо `0xFE`,
+ * приложение читает 162 и получает лишний байт в stdin.
+ *
+ * То есть порча начинается на колонке 95 (`32 + 95 = 127`), а отказ стоял на 224 — защита
+ * была на 130 колонок правее места поломки. Предел приведён к тому, что реально проходит
+ * по проводу без искажения.
+ *
+ * Терминалы шире 95 колонок — норма, поэтому единственное настоящее лечение — SGR; отказ
+ * здесь честно говорит, что клик в эту точку невозможен, вместо тихого промаха.
+ */
+export const X10_MAX_COORD = 95;
 
 export function modifierBits(mods: MouseModifiers | undefined): number {
   if (!mods) return 0;
@@ -88,6 +112,8 @@ export function encodeMouseEvent(input: {
   row: number;
   sgr: boolean;
   modifiers?: MouseModifiers;
+  /** Для `move`: какая кнопка зажата. `undefined` — ни одной (hover). */
+  heldButton?: MouseButton;
 }): string {
   const { action, button, col, row, sgr } = input;
   if (col < 0 || row < 0) throw new Error(`Отрицательная координата: col=${col}, row=${row}`);
@@ -96,7 +122,7 @@ export function encodeMouseEvent(input: {
   if (button === "wheel-up") code = WHEEL_UP;
   else if (button === "wheel-down") code = WHEEL_DOWN;
   else code = BUTTON_CODE[button];
-  if (action === "move") code |= MOTION_FLAG;
+  if (action === "move") code = (input.heldButton === undefined ? NO_BUTTON : BUTTON_CODE[input.heldButton]) | MOTION_FLAG;
   code |= modifierBits(input.modifiers);
 
   const c = col + 1;
@@ -107,9 +133,10 @@ export function encodeMouseEvent(input: {
     // этому приложение знает, какая именно кнопка отпущена.
     return `\x1b[<${code};${c};${r}${action === "release" ? "m" : "M"}`;
   }
-  if (c > X10_MAX_COORD + 1 || r > X10_MAX_COORD + 1) {
+  if (c > X10_MAX_COORD || r > X10_MAX_COORD) {
     throw new Error(
-      `Координата (${c},${r}) не выражается в устаревшей кодировке X10 (предел ${X10_MAX_COORD + 1}). ` +
+      `Координата (${c},${r}) не проходит по проводу в устаревшей кодировке X10 (предел ${X10_MAX_COORD}): ` +
+        "PTY кодирует запись в UTF-8, и байт выше 127 уезжает двумя, смещая координату у приложения. " +
         "Приложение не включило SGR-режим мыши (CSI ? 1006 h) — клик в эту точку невозможен без промаха."
     );
   }
@@ -132,22 +159,25 @@ export function encodeClick(input: {
   return press + encodeMouseEvent({ ...input, action: "release" });
 }
 
-const SGR_ON = /\x1b\[\?1006h/;
-const SGR_OFF = /\x1b\[\?1006l/;
-
 /**
  * Обновляет флаг SGR по куску вывода PTY.
  *
  * Последний переключатель в куске побеждает — приложение могло включить и выключить
  * режим в одной записи, и порядок здесь важнее факта наличия.
+ *
+ * ⚠ Разбирается МНОГОПАРАМЕТРИЧЕСКАЯ форма: `CSI ? 1000;1006 h` — законная и
+ * распространённая запись, которой приложение включает отслеживание и SGR одним
+ * управляющим кодом. Первая версия искала `\x1b[?1006` вплотную и такую форму не видела:
+ * `@xterm/headless` разбирал её верно (`tracking=vt200`), а мы считали приложение
+ * устаревшим и слали ему X10 — то есть мусорный ввод ровно тому интерфейсу, ради которого
+ * мышь и писалась.
  */
 export function trackSgrMode(chunk: string, current: boolean): boolean {
   let last = current;
-  const re = /\x1b\[\?1006(h|l)/g;
+  const re = /\x1b\[\?([0-9;]+)([hl])/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(chunk)) !== null) last = m[1] === "h";
-  // Явные проверки оставлены читаемыми: они же документируют, что именно мы ищем.
-  void SGR_ON;
-  void SGR_OFF;
+  while ((m = re.exec(chunk)) !== null) {
+    if (m[1].split(";").includes("1006")) last = m[2] === "h";
+  }
   return last;
 }

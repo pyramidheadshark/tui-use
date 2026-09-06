@@ -210,6 +210,31 @@ program
     });
   });
 
+/**
+ * Целое неотрицательное число из аргумента командной строки.
+ *
+ * ⚠ `parseInt("abc")` даёт NaN, который уезжает в JSON как `null`, а приложение получает
+ * колонку 0 — и вызывающий видит `ok: true`. Дробное `1.5` вообще попадало прямо в
+ * управляющую последовательность (`\x1b[<0;2.5;3.5M`). Проверка была только у `click`.
+ */
+function requireCoord(raw: string, what: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    process.stderr.write(`Error: ${what} must be a non-negative integer, got "${raw}"\n`);
+    process.exit(1);
+  }
+  return n;
+}
+
+const MOUSE_BUTTONS = ["left", "middle", "right"] as const;
+function requireButton(raw: unknown): "left" | "middle" | "right" {
+  if (typeof raw !== "string" || !MOUSE_BUTTONS.includes(raw as never)) {
+    process.stderr.write(`Error: --button must be one of ${MOUSE_BUTTONS.join(" | ")}, got "${String(raw)}"\n`);
+    process.exit(1);
+  }
+  return raw as "left" | "middle" | "right";
+}
+
 // ---- click / mousemove / wheel ----
 //
 // Координаты берутся в системе СНАПШОТА: `tui-use find "Кнопка"` печатает `L3,C10-16`,
@@ -224,18 +249,14 @@ program
   .option("--alt", "hold Alt")
   .option("--shift", "hold Shift")
   .action(async (col: string, row: string, opts: Record<string, unknown>) => {
-    const c = parseInt(col, 10);
-    const r = parseInt(row, 10);
-    if (isNaN(c) || isNaN(r)) {
-      process.stderr.write("Error: col and row must be numbers\n");
-      process.exit(1);
-    }
+    const c = requireCoord(col, "col");
+    const r = requireCoord(row, "row");
     const res = await sendRequest({
       type: "mouse",
       action: "click",
       col: c,
       row: r,
-      button: (opts.button as "left" | "middle" | "right") ?? "left",
+      button: requireButton(opts.button ?? "left"),
       raw: Boolean(opts.raw),
       modifiers: { ctrl: Boolean(opts.ctrl), alt: Boolean(opts.alt), shift: Boolean(opts.shift) },
     });
@@ -252,8 +273,8 @@ program
     const res = await sendRequest({
       type: "mouse",
       action: "move",
-      col: parseInt(col, 10),
-      row: parseInt(row, 10),
+      col: requireCoord(col, "col"),
+      row: requireCoord(row, "row"),
       raw: Boolean(opts.raw),
     });
     handleResponse(res, (x) => {
@@ -275,9 +296,9 @@ program
       type: "mouse",
       action: "wheel",
       direction,
-      col: parseInt(col, 10),
-      row: parseInt(row, 10),
-      count: parseInt(String(opts.count ?? "1"), 10),
+      col: requireCoord(col, "col"),
+      row: requireCoord(row, "row"),
+      count: requireCoord(String(opts.count ?? "1"), "--count"),
       raw: Boolean(opts.raw),
     });
     handleResponse(res, (x) => {

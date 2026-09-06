@@ -148,6 +148,9 @@ tui-use snapshot --format json                 # JSON output
 tui-use scrollup <n>                           # Scroll up to older content
 tui-use scrolldown <n>                         # Scroll down to newer content
 tui-use find <pattern>                         # Search in screen (regex)
+tui-use click <col> <row>          # Click at snapshot coordinates (same frame as `find`)
+tui-use mousemove <col> <row>      # Hover without pressing (needs drag/any tracking)
+tui-use wheel up|down [col] [row]  # Mouse wheel at a point
 tui-use wait                                   # Wait for screen change (default timeout: 3000ms)
 tui-use wait <ms>                              # Custom timeout, e.g. wait 5000
 tui-use wait --text <pattern>                  # Wait until screen contains pattern

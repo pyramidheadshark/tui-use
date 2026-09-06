@@ -18,8 +18,20 @@ describe("encodeMouseEvent — SGR", () => {
     expect(encodeMouseEvent({ action: "release", button: "right", col: 0, row: 0, sgr: true })).toBe("\x1b[<2;1;1m");
   });
 
-  it("движение поднимает флаг 32", () => {
-    expect(encodeMouseEvent({ action: "move", button: "left", col: 0, row: 0, sgr: true })).toBe("\x1b[<32;1;1M");
+  // ⚠ Движение БЕЗ нажатия — это 35 (`32 + 3`, «кнопка не нажата»), а не 32: 32 означает
+  // перетаскивание с зажатой левой. Разница не формальная — hover-состояние достигается
+  // только первым, а именно ради него мышь и заводилась.
+  it("движение без кнопки — 35, а не 32", () => {
+    expect(encodeMouseEvent({ action: "move", button: "left", col: 0, row: 0, sgr: true })).toBe("\x1b[<35;1;1M");
+  });
+
+  it("движение с зажатой кнопкой — перетаскивание, 32 для левой", () => {
+    expect(
+      encodeMouseEvent({ action: "move", button: "left", heldButton: "left", col: 0, row: 0, sgr: true })
+    ).toBe("\x1b[<32;1;1M");
+    expect(
+      encodeMouseEvent({ action: "move", button: "left", heldButton: "right", col: 0, row: 0, sgr: true })
+    ).toBe("\x1b[<34;1;1M");
   });
 
   it("колесо вверх — 64, вниз — 65", () => {
@@ -54,18 +66,33 @@ describe("encodeMouseEvent — устаревшая X10", () => {
     expect(out.charCodeAt(3)).toBe(32 + 3);
   });
 
-  // ⚠ Самое важное свойство: X10 физически не выражает колонку дальше 223, и молчаливый
-  // промах здесь неотличим от «приложение не отреагировало на клик».
-  it("НЕГАТИВНЫЙ: за пределом 223 — внятный отказ, а не тихий промах", () => {
+  // ⚠ Предел — 95, а не 223: PTY кодирует запись в UTF-8, и байт `32 + n` выше 127
+  // уезжает ДВУМЯ байтами, смещая координату у приложения. Первая версия ставила отказ
+  // на 224, то есть на 130 колонок правее места поломки.
+  //
+  // Границу проверяем ОБЕ соседние ячейки: тест «на границе» на 222 при пределе 223
+  // не проверял саму границу вовсе, и правильная починка проходила незамеченной.
+  it("НЕГАТИВНЫЙ: за пределом — внятный отказ, а не тихий промах", () => {
     expect(() =>
-      encodeMouseEvent({ action: "press", button: "left", col: X10_MAX_COORD + 1, row: 0, sgr: false })
+      encodeMouseEvent({ action: "press", button: "left", col: X10_MAX_COORD, row: 0, sgr: false })
     ).toThrow(/X10/);
   });
 
-  it("ровно на границе 223 — ещё можно", () => {
+  it("ровно на границе — ещё можно, на единицу дальше — уже нет", () => {
     expect(() =>
       encodeMouseEvent({ action: "press", button: "left", col: X10_MAX_COORD - 1, row: 0, sgr: false })
     ).not.toThrow();
+    expect(() =>
+      encodeMouseEvent({ action: "press", button: "left", col: X10_MAX_COORD, row: 0, sgr: false })
+    ).toThrow();
+  });
+
+  it("НЕГАТИВНЫЙ: каждый байт X10 умещается в один — иначе UTF-8 удвоит его на проводе", () => {
+    for (let c = 0; c < X10_MAX_COORD; c += 1) {
+      const out = encodeMouseEvent({ action: "press", button: "left", col: c, row: c, sgr: false });
+      for (const ch of out) expect(ch.charCodeAt(0)).toBeLessThan(128);
+      expect(Buffer.byteLength(out, "utf8")).toBe(out.length);
+    }
   });
 });
 
@@ -118,6 +145,21 @@ describe("trackSgrMode", () => {
   it("включение и выключение читаются из потока", () => {
     expect(trackSgrMode("\x1b[?1006h", false)).toBe(true);
     expect(trackSgrMode("\x1b[?1006l", true)).toBe(false);
+  });
+
+  // ⚠ Самая частая живая форма: приложение включает отслеживание и SGR ОДНИМ кодом.
+  // Первая версия искала `\x1b[?1006` вплотную и такую запись не видела — то есть считала
+  // SGR-приложение устаревшим и слала ему X10.
+  it("комбинированный DECSET распознаётся в любом порядке параметров", () => {
+    expect(trackSgrMode("\x1b[?1000;1006h", false)).toBe(true);
+    expect(trackSgrMode("\x1b[?1000;1002;1006h", false)).toBe(true);
+    expect(trackSgrMode("\x1b[?1006;1002h", false)).toBe(true);
+    expect(trackSgrMode("\x1b[?1000;1006l", true)).toBe(false);
+  });
+
+  it("НЕГАТИВНЫЙ: 1006 как ЧАСТЬ другого числа не считается", () => {
+    expect(trackSgrMode("\x1b[?11006h", false)).toBe(false);
+    expect(trackSgrMode("\x1b[?10061h", false)).toBe(false);
   });
 
   it("последний переключатель в куске побеждает", () => {

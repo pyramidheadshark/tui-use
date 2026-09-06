@@ -34,6 +34,10 @@ tui-use wait --debounce <ms>                   # Idle window before resolving (d
 tui-use snapshot                               # Get current screen
 tui-use snapshot --format json                 # JSON output
 tui-use find <pattern>                         # Search in screen (regex)
+tui-use click <col> <row>                      # Click at SNAPSHOT coordinates (same frame as find)
+tui-use click <col> <row> -b right --ctrl      # Button + modifiers (left|middle|right, --ctrl/--alt/--shift)
+tui-use mousemove <col> <row>                  # Hover without pressing (needs drag/any tracking)
+tui-use wheel up|down [col] [row] -n <count>   # Mouse wheel at a point
 tui-use scrollup <n>                           # Scroll up to older content
 tui-use scrolldown <n>                         # Scroll down to newer content
 tui-use list                                   # List all sessions
@@ -42,6 +46,44 @@ tui-use rename <label>                         # Rename session
 tui-use kill                                   # Kill current session
 tui-use daemon status/stop/restart             # Manage daemon
 ```
+
+---
+
+## Mouse
+
+Some TUIs — anything built on `@opentui/core`, for instance — have clickable controls whose
+states (hover, armed) the keyboard cannot reach at all. For those, `click` is not a
+convenience; it is the only way in.
+
+**Coordinates are snapshot coordinates.** `find` prints `L3,C10-16`; `tui-use click 10 3`
+lands there. The translation to raw viewport rows is done for you — `snapshot()` trims
+blank leading lines, and doing that arithmetic by hand is how you miss by exactly the
+number of trimmed rows. `--raw` opts out if you are already counting in viewport rows.
+
+**Refusals are informative, and you should read them.**
+
+```
+$ tui-use click 5 0
+Error: Приложение не включало отслеживание мыши (mouseTrackingMode=none). …
+```
+
+An app that never enabled mouse reporting would receive those bytes as ordinary keystrokes,
+so the click is refused instead of quietly corrupting its input. Two more refusals of the
+same kind: a coordinate outside the terminal (usually a stale snapshot — take a new one),
+and a coordinate a legacy-encoding app cannot express (column > 95 without SGR).
+
+`tui-use info` prints what the app actually declared:
+
+```
+Mouse: tracking=vt200 encoding=sgr
+```
+
+`tracking=none` means the app is not listening; `encoding=x10` means the legacy encoding,
+which cannot address wide terminals.
+
+**Do not reach for the mouse first.** Keyboard navigation is more robust and survives
+re-layout; use `click` when a control has no keyboard path, or when you are specifically
+testing pointer behaviour.
 
 ---
 

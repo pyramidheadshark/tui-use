@@ -305,6 +305,29 @@ export class Session {
     this.ptyProcess.write(mapped);
   }
 
+  /**
+   * Сколько пустых строк срезано сверху — БЕЗ побочного эффекта.
+   *
+   * ⚠ `snapshot()` не только читает: он перезаписывает `lastSnapshot`, то есть базовую
+   * линию детекции изменений, на которой стоит `wait()`. Первая версия клика звала его
+   * ради одного числа и тем самым съедала «экран изменился» — ровно посреди канонической
+   * петли агента `type → click → wait`, где `wait` после этого досиживал до таймаута.
+   *
+   * Асимметрия была ещё хуже самого дефекта: тернарник короткозамкнут, поэтому `--raw`
+   * базовую линию НЕ сбрасывал, а обычный клик сбрасывал — один флаг, документированный
+   * как «координаты сырые», молча менял ещё и семантику детекции изменений.
+   */
+  private leadingTrimmedNow(): number {
+    const buf = this.terminal.buffer.active;
+    const rows: string[] = [];
+    for (let i = 0; i < this.terminal.rows; i += 1) {
+      rows.push(buf.getLine(buf.viewportY + i)?.translateToString(true) ?? "");
+    }
+    let leading = 0;
+    while (leading < rows.length && rows[leading].trim() === "") leading += 1;
+    return leading;
+  }
+
   /** Режим отслеживания мыши, объявленный приложением (DECSET 9/1000/1002/1003). */
   get mouseTrackingMode(): MouseTrackingMode {
     return this.terminal.modes.mouseTrackingMode;
@@ -313,6 +336,26 @@ export class Session {
   /** Включил ли приложение SGR-кодировку (`CSI ? 1006 h`). */
   get sgrMouse(): boolean {
     return this._sgrMouse;
+  }
+
+  /**
+   * Координата обязана лежать внутри терминала.
+   *
+   * Клик по координате из устаревшего снапшота — самая частая ошибка вызывающего, и без
+   * этой проверки он получал `ok: true` и код 0 там, где попадания не было: приложение
+   * просто не имеет такой ячейки. «Отказ вместо молчания» был закрыт только для случая
+   * «мышь выключена».
+   */
+  private assertInBounds(col: number, viewportRow: number): void {
+    if (!Number.isInteger(col) || !Number.isInteger(viewportRow)) {
+      throw new Error(`Координата должна быть целым числом, получено (${col}, ${viewportRow}).`);
+    }
+    if (col < 0 || viewportRow < 0 || col >= this.cols || viewportRow >= this.rows) {
+      throw new Error(
+        `Координата (${col}, ${viewportRow}) вне терминала ${this.cols}x${this.rows}. ` +
+          "Скорее всего она взята из устаревшего снапшота — сними снапшот заново."
+      );
+    }
   }
 
   private assertMouseAccepted(action: "press" | "release" | "move"): void {
@@ -346,7 +389,8 @@ export class Session {
     options?: { button?: MouseButton; raw?: boolean; modifiers?: MouseModifiers }
   ): { col: number; row: number; encoding: "sgr" | "x10" } {
     this.assertMouseAccepted("press");
-    const viewportRow = options?.raw ? row : toViewportRow(row, this.snapshot().leading_trimmed);
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.leadingTrimmedNow());
+    this.assertInBounds(col, viewportRow);
     this.ptyProcess.write(
       encodeClick({
         button: options?.button ?? "left",
@@ -363,7 +407,8 @@ export class Session {
   /** Перемещение курсора мыши без нажатия — принимается только в режимах drag/any. */
   mouseMove(col: number, row: number, options?: { raw?: boolean }): { col: number; row: number } {
     this.assertMouseAccepted("move");
-    const viewportRow = options?.raw ? row : toViewportRow(row, this.snapshot().leading_trimmed);
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.leadingTrimmedNow());
+    this.assertInBounds(col, viewportRow);
     this.ptyProcess.write(
       encodeMouseEvent({ action: "move", button: "left", col, row: viewportRow, sgr: this._sgrMouse })
     );
@@ -378,7 +423,8 @@ export class Session {
     options?: { raw?: boolean; count?: number }
   ): { col: number; row: number; count: number } {
     this.assertMouseAccepted("press");
-    const viewportRow = options?.raw ? row : toViewportRow(row, this.snapshot().leading_trimmed);
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.leadingTrimmedNow());
+    this.assertInBounds(col, viewportRow);
     const count = Math.max(1, options?.count ?? 1);
     for (let i = 0; i < count; i += 1) {
       this.ptyProcess.write(
