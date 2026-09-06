@@ -255,6 +255,54 @@ async function handleRequest(req: Request): Promise<Response> {
       return { type: "find", matches };
     }
 
+    case "mouse": {
+      if (!currentSession) {
+        return { type: "error", message: "No current session. Run 'tui-use use <session_id>' first." };
+      }
+      const session = sessions.get(currentSession);
+      if (!session) {
+        return { type: "error", message: `Session not found: ${currentSession}` };
+      }
+      const r = req as import("./protocol").MouseRequest;
+      // Отказ приложения принимать мышь приходит исключением из сессии и уезжает
+      // вызывающему ТЕКСТОМ: «клик не сработал» обязано отличаться от «мышь выключена».
+      try {
+        if (r.action === "click") {
+          const out = session.click(r.col, r.row, { button: r.button, raw: r.raw, modifiers: r.modifiers });
+          return {
+            type: "mouse",
+            ok: true,
+            col: out.col,
+            row: out.row,
+            tracking: session.mouseTrackingMode,
+            encoding: out.encoding,
+          };
+        }
+        if (r.action === "move") {
+          const out = session.mouseMove(r.col, r.row, { raw: r.raw });
+          return {
+            type: "mouse",
+            ok: true,
+            col: out.col,
+            row: out.row,
+            tracking: session.mouseTrackingMode,
+            encoding: session.sgrMouse ? "sgr" : "x10",
+          };
+        }
+        const out = session.wheel(r.direction ?? "down", r.col, r.row, { raw: r.raw, count: r.count });
+        return {
+          type: "mouse",
+          ok: true,
+          col: out.col,
+          row: out.row,
+          tracking: session.mouseTrackingMode,
+          encoding: session.sgrMouse ? "sgr" : "x10",
+        };
+      } catch (e) {
+        return { type: "error", message: e instanceof Error ? e.message : String(e) };
+      }
+    }
+
     case "scroll": {
       if (!currentSession) {
         return { type: "error", message: "No current session. Run 'tui-use use <session_id>' first." };
@@ -286,6 +334,9 @@ async function handleRequest(req: Request): Promise<Response> {
         start_time: session.startTime,
         cols: session.cols,
         rows: session.rows,
+        // Без этих двух полей «клик не сработал» неотличимо от «приложение мышь не включало».
+        mouse_tracking: session.mouseTrackingMode,
+        mouse_encoding: session.sgrMouse ? "sgr" : "x10",
       };
     }
 
@@ -303,7 +354,17 @@ async function handleRequest(req: Request): Promise<Response> {
     }
 
     default: {
-      return { type: "error", message: "Unknown request type" };
+      // ⚠ Сокет один на пользователя, и демон переживает обновление пакета: новый CLI
+      // говорит со СТАРЫМ демоном, пока его не перезапустить. Раньше это давало голое
+      // «Unknown request type», по которому нельзя понять ни что устарело, ни что делать.
+      // Первый же живой прогон новой команды мыши упёрся ровно в это.
+      return {
+        type: "error",
+        message:
+          `Демон не знает запрос "${(req as { type?: string }).type}". Скорее всего он запущен из ` +
+          `предыдущей версии tui-use: сокет один на пользователя и переживает обновление пакета. ` +
+          `Перезапусти: tui-use stop && tui-use daemon`,
+      };
     }
   }
 }

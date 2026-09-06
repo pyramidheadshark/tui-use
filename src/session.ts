@@ -9,7 +9,18 @@
 import * as pty from "node-pty";
 import { Terminal } from "@xterm/headless";
 import { SessionInfo } from "./protocol";
+import { adjustCursor } from "./cursor";
 import { extractHighlights, Highlight } from "./highlights";
+import {
+  acceptsMouse,
+  encodeClick,
+  encodeMouseEvent,
+  MouseButton,
+  MouseModifiers,
+  MouseTrackingMode,
+  toViewportRow,
+  trackSgrMode,
+} from "./mouse";
 
 // ---- ANSI re-encoding helpers ----
 
@@ -188,6 +199,7 @@ export class Session {
 
   private ptyProcess: pty.IPty;
   private terminal: Terminal;
+  private _sgrMouse = false;
   private _status: "running" | "exited" = "running";
   private _exitCode: number | null = null;
   private lastSnapshot: string = "";
@@ -235,6 +247,10 @@ export class Session {
     });
 
     this.ptyProcess.onData((data: string) => {
+      // Кодировку мыши отслеживаем САМИ: `@xterm/headless` отдаёт `modes.mouseTrackingMode`,
+      // но не отдаёт выбор между SGR (`CSI ? 1006 h`) и устаревшей X10. Разница не
+      // косметическая — X10 не выражает колонку больше 223 и молча промахивается.
+      this._sgrMouse = trackSgrMode(data, this._sgrMouse);
       this.terminal.write(data);
       this.notifyListeners();
     });
@@ -290,11 +306,146 @@ export class Session {
   }
 
   /**
+   * Сколько пустых строк срезано сверху — БЕЗ побочного эффекта.
+   *
+   * ⚠ `snapshot()` не только читает: он перезаписывает `lastSnapshot`, то есть базовую
+   * линию детекции изменений, на которой стоит `wait()`. Первая версия клика звала его
+   * ради одного числа и тем самым съедала «экран изменился» — ровно посреди канонической
+   * петли агента `type → click → wait`, где `wait` после этого досиживал до таймаута.
+   *
+   * Асимметрия была ещё хуже самого дефекта: тернарник короткозамкнут, поэтому `--raw`
+   * базовую линию НЕ сбрасывал, а обычный клик сбрасывал — один флаг, документированный
+   * как «координаты сырые», молча менял ещё и семантику детекции изменений.
+   */
+  private leadingTrimmedNow(): number {
+    const buf = this.terminal.buffer.active;
+    const rows: string[] = [];
+    for (let i = 0; i < this.terminal.rows; i += 1) {
+      rows.push(buf.getLine(buf.viewportY + i)?.translateToString(true) ?? "");
+    }
+    let leading = 0;
+    while (leading < rows.length && rows[leading].trim() === "") leading += 1;
+    return leading;
+  }
+
+  /** Режим отслеживания мыши, объявленный приложением (DECSET 9/1000/1002/1003). */
+  get mouseTrackingMode(): MouseTrackingMode {
+    return this.terminal.modes.mouseTrackingMode;
+  }
+
+  /** Включил ли приложение SGR-кодировку (`CSI ? 1006 h`). */
+  get sgrMouse(): boolean {
+    return this._sgrMouse;
+  }
+
+  /**
+   * Координата обязана лежать внутри терминала.
+   *
+   * Клик по координате из устаревшего снапшота — самая частая ошибка вызывающего, и без
+   * этой проверки он получал `ok: true` и код 0 там, где попадания не было: приложение
+   * просто не имеет такой ячейки. «Отказ вместо молчания» был закрыт только для случая
+   * «мышь выключена».
+   */
+  private assertInBounds(col: number, viewportRow: number): void {
+    if (!Number.isInteger(col) || !Number.isInteger(viewportRow)) {
+      throw new Error(`Координата должна быть целым числом, получено (${col}, ${viewportRow}).`);
+    }
+    if (col < 0 || viewportRow < 0 || col >= this.cols || viewportRow >= this.rows) {
+      throw new Error(
+        `Координата (${col}, ${viewportRow}) вне терминала ${this.cols}x${this.rows}. ` +
+          "Скорее всего она взята из устаревшего снапшота — сними снапшот заново."
+      );
+    }
+  }
+
+  private assertMouseAccepted(action: "press" | "release" | "move"): void {
+    if (this._status === "exited") {
+      throw new Error(`Session ${this.id} has already exited`);
+    }
+    const mode = this.mouseTrackingMode;
+    if (acceptsMouse(mode, action)) return;
+    // Отказ, а не молчание: приложение, не включавшее мышь, получит эти байты как обычный
+    // ввод — в оболочке они окажутся текстом в командной строке. Молчаливая отправка
+    // выглядела бы как «клик не сработал», а на деле портила бы состояние.
+    throw new Error(
+      mode === "none"
+        ? `Приложение не включало отслеживание мыши (mouseTrackingMode=none). ` +
+          `Отправка события мыши ушла бы в stdin как мусорный ввод. ` +
+          `Если интерфейс кликабельный, дай ему дорисоваться и повтори: режим объявляется при старте.`
+        : `Режим мыши "${mode}" не принимает событие "${action}" (x10 подписан только на нажатие).`
+    );
+  }
+
+  /**
+   * Клик по координатам СНАПШОТА (той же системе, что `lines[]`, `cursor` и `find`).
+   *
+   * Перевод в сырую систему вьюпорта делает `toViewportRow`, а не вызывающий: обрезанных
+   * сверху строк он не видит, и держать поправку в голове — источник промаха ровно на
+   * `leading_trimmed`. `raw: true` отключает поправку для тех, кто уже считает в сырой.
+   */
+  click(
+    col: number,
+    row: number,
+    options?: { button?: MouseButton; raw?: boolean; modifiers?: MouseModifiers }
+  ): { col: number; row: number; encoding: "sgr" | "x10" } {
+    this.assertMouseAccepted("press");
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.leadingTrimmedNow());
+    this.assertInBounds(col, viewportRow);
+    this.ptyProcess.write(
+      encodeClick({
+        button: options?.button ?? "left",
+        col,
+        row: viewportRow,
+        sgr: this._sgrMouse,
+        mode: this.mouseTrackingMode,
+        modifiers: options?.modifiers,
+      })
+    );
+    return { col, row: viewportRow, encoding: this._sgrMouse ? "sgr" : "x10" };
+  }
+
+  /** Перемещение курсора мыши без нажатия — принимается только в режимах drag/any. */
+  mouseMove(col: number, row: number, options?: { raw?: boolean }): { col: number; row: number } {
+    this.assertMouseAccepted("move");
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.leadingTrimmedNow());
+    this.assertInBounds(col, viewportRow);
+    this.ptyProcess.write(
+      encodeMouseEvent({ action: "move", button: "left", col, row: viewportRow, sgr: this._sgrMouse })
+    );
+    return { col, row: viewportRow };
+  }
+
+  /** Прокрутка колесом. Кодируется как нажатие кнопки 64/65 — так его ждёт приложение. */
+  wheel(
+    direction: "up" | "down",
+    col: number,
+    row: number,
+    options?: { raw?: boolean; count?: number }
+  ): { col: number; row: number; count: number } {
+    this.assertMouseAccepted("press");
+    const viewportRow = options?.raw ? row : toViewportRow(row, this.leadingTrimmedNow());
+    this.assertInBounds(col, viewportRow);
+    const count = Math.max(1, options?.count ?? 1);
+    for (let i = 0; i < count; i += 1) {
+      this.ptyProcess.write(
+        encodeMouseEvent({
+          action: "press",
+          button: direction === "up" ? "wheel-up" : "wheel-down",
+          col,
+          row: viewportRow,
+          sgr: this._sgrMouse,
+        })
+      );
+    }
+    return { col, row: viewportRow, count };
+  }
+
+  /**
    * Return the current rendered screen as raw lines + cursor.
    * Trailing empty lines and per-line trailing spaces are removed.
    * Updates lastSnapshot for change detection.
    */
-  snapshot(options?: { color?: boolean }): { lines: string[]; cursor: { x: number; y: number }; changed: boolean; highlights: Highlight[]; title: string; is_fullscreen: boolean } {
+  snapshot(options?: { color?: boolean }): { lines: string[]; cursor: { x: number; y: number }; changed: boolean; highlights: Highlight[]; title: string; is_fullscreen: boolean; leading_trimmed: number; trailing_trimmed: number } {
     const buf = this.terminal.buffer.active;
     const useColor = options?.color ?? false;
     const plainLines: string[] = [];
@@ -303,12 +454,16 @@ export class Session {
       plainLines.push((buf.getLine(startY + i)?.translateToString(true) ?? "").trimEnd());
     }
     // Remove trailing empty lines
+    let plainTrailingTrimmed = 0;
     while (plainLines.length > 0 && plainLines[plainLines.length - 1] === "") {
       plainLines.pop();
+      plainTrailingTrimmed++;
     }
     // Remove leading empty lines (TUI apps like fzf render from bottom)
+    let plainLeadingTrimmed = 0;
     while (plainLines.length > 0 && plainLines[0] === "") {
       plainLines.shift();
+      plainLeadingTrimmed++;
     }
     // Change detection always uses plain text
     const plainScreen = plainLines.join("\n");
@@ -317,6 +472,8 @@ export class Session {
 
     // Build color lines if requested
     let lines: string[];
+    let colorLeadingTrimmed = 0;
+    let colorTrailingTrimmed = 0;
     if (useColor) {
       lines = [];
       for (let i = 0; i < this.terminal.rows; i++) {
@@ -326,21 +483,43 @@ export class Session {
       // Trim trailing empty lines (match plain text trimming)
       while (lines.length > 0 && lines[lines.length - 1] === "") {
         lines.pop();
+        colorTrailingTrimmed++;
       }
       while (lines.length > 0 && lines[0] === "") {
         lines.shift();
+        colorLeadingTrimmed++;
       }
     } else {
       lines = plainLines;
     }
-    const highlights = extractHighlights(buf, this.terminal.rows, startY);
+
+    // Coordinates are reported in the SAME frame as `lines`.
+    //
+    // Before this, three frames coexisted: `lines` was trimmed, while `cursor` and
+    // `highlights` kept raw viewport rows, so any caller indexing `lines[cursor.y]`
+    // was off by exactly the number of trimmed leading rows. Worse, the colour branch
+    // trims independently — `renderLineWithColor` returns a non-empty string for a
+    // visually blank line that carries a background colour (panels, status bars,
+    // selected rows), so plain and colour modes could trim different amounts.
+    //
+    // `leading_trimmed`/`trailing_trimmed` are reported for the mode actually
+    // returned, so a caller can always map back to raw buffer rows if it needs to.
+    const leadingTrimmed = useColor ? colorLeadingTrimmed : plainLeadingTrimmed;
+    const trailingTrimmed = useColor ? colorTrailingTrimmed : plainTrailingTrimmed;
+
+    const highlights = extractHighlights(buf, this.terminal.rows, startY)
+      .map((h) => ({ ...h, line: h.line - leadingTrimmed }))
+      .filter((h) => h.line >= 0 && h.line < lines.length);
+
     return {
       lines,
-      cursor: { x: buf.cursorX, y: buf.cursorY },
+      cursor: adjustCursor({ x: buf.cursorX, y: buf.cursorY }, leadingTrimmed, trailingTrimmed, this.terminal.rows),
       changed,
       highlights,
       title: this._title,
       is_fullscreen: this._isFullscreen,
+      leading_trimmed: leadingTrimmed,
+      trailing_trimmed: trailingTrimmed,
     };
   }
 
@@ -437,25 +616,40 @@ export class Session {
     const buf = this.terminal.buffer.active;
     let regex: RegExp;
     try {
-      regex = new RegExp(pattern);
+      // The `g` flag is what makes the loop below find EVERY occurrence. Without it
+      // a single exec() returned at most one match per line, silently hiding the rest.
+      regex = new RegExp(pattern, "g");
     } catch {
       return matches;
     }
 
     const startY = buf.viewportY;
+    // Report rows in the same frame as snapshot().lines — see the note in snapshot().
+    const { leading_trimmed: leadingTrimmed, lines } = this.snapshot();
+
     for (let i = 0; i < this.terminal.rows; i++) {
       const line = buf.getLine(startY + i);
-      if (line) {
-        const lineText = line.translateToString(true);
-        const match = regex.exec(lineText);
-        if (match) {
+      if (!line) continue;
+      const lineText = line.translateToString(true);
+      regex.lastIndex = 0;
+
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(lineText)) !== null) {
+        const row = i - leadingTrimmed;
+        if (row >= 0 && row < lines.length) {
           matches.push({
-            line: i,
+            line: row,
             col_start: match.index,
-            col_end: match.index + match[0].length,
+            // INCLUSIVE, matching Highlight.col_end ("index of the last character").
+            // It used to be exclusive here while inclusive there — the same number
+            // meant two different columns depending on which call produced it.
+            col_end: match.index + match[0].length - 1,
             text: match[0],
           });
         }
+        // A zero-length match would never advance lastIndex — step over it manually,
+        // otherwise the loop spins forever on patterns like `a*` or `^`.
+        if (match[0].length === 0) regex.lastIndex++;
       }
     }
     return matches;
